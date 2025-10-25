@@ -1,0 +1,85 @@
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    expose:
+      - "5678"
+    env_file:
+      - .env.tunnel
+    environment:
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - GENERIC_TIMEZONE=Asia/Bangkok
+      - N8N_PROXY_HOPS=1
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - dokploy-network
+
+  cf-tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 --url http://n8n:5678
+    depends_on:
+      - n8n
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:20241/metrics >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  tunnel-sync:
+    # Uses Docker CLI + Compose plugin to update env file and restart n8n when URL changes
+    image: docker/compose:2
+    restart: unless-stopped
+    depends_on:
+      - cf-tunnel
+    working_dir: /workspace
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/workspace
+    command: >
+      sh -c '
+        # wait for a tunnel URL
+        until URL=$(
+          docker logs cf-tunnel 2>&1 |
+          grep -Eo "https://[a-z0-9-]+\\.trycloudflare\\.com" |
+          tail -1
+        ); do
+          echo "waiting for tunnel URL..."; sleep 2;
+        done;
+        # write env for n8n and (re)start it
+        echo "N8N_HOST=${URL#https://}" > .env.tunnel;
+        echo "N8N_PROTOCOL=https"        >> .env.tunnel;
+        echo "WEBHOOK_URL=${URL}/"       >> .env.tunnel;
+        echo "Updated .env.tunnel with $URL; restarting n8n...";
+        docker compose up -d n8n;
+        # watch for changes and keep n8n in sync
+        PREV="$URL";
+        while sleep 5; do
+          NEW=$(
+            docker logs cf-tunnel 2>&1 |
+            grep -Eo "https://[a-z0-9-]+\\.trycloudflare\\.com" |
+            tail -1
+          );
+          if [ -n "$NEW" ] && [ "$NEW" != "$PREV" ]; then
+            echo "Tunnel URL changed -> $NEW";
+            echo "N8N_HOST=${NEW#https://}" > .env.tunnel;
+            echo "N8N_PROTOCOL=https"       >> .env.tunnel;
+            echo "WEBHOOK_URL=${NEW}/"      >> .env.tunnel;
+            docker compose up -d n8n;
+            PREV="$NEW";
+          fi
+        done
+      '
+    networks:
+      - dokploy-network
+
+volumes:
+  n8n_data:
+
+networks:
+  dokploy-network:
+    external: true
